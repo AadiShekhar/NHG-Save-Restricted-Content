@@ -11,6 +11,13 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 from config import API_ID, API_HASH, ERROR_MESSAGE
 from database.db import db
 from TechVJ.strings import HELP_TXT
+import shutil
+from datetime import datetime
+
+# Create downloads directory
+DOWNLOADS_DIR = "downloads"
+if not os.path.exists(DOWNLOADS_DIR):
+    os.makedirs(DOWNLOADS_DIR)
 
 class batch_temp(object):
     IS_BATCH = {}
@@ -27,23 +34,6 @@ async def downstatus(client, statusfile, message, chat):
             txt = downread.read()
         try:
             await client.edit_message_text(chat, message.id, f"**Downloaded:** **{txt}**")
-            await asyncio.sleep(10)
-        except:
-            await asyncio.sleep(5)
-
-
-# upload status
-async def upstatus(client, statusfile, message, chat):
-    while True:
-        if os.path.exists(statusfile):
-            break
-
-        await asyncio.sleep(3)      
-    while os.path.exists(statusfile):
-        with open(statusfile, "r") as upread:
-            txt = upread.read()
-        try:
-            await client.edit_message_text(chat, message.id, f"**Uploaded:** **{txt}**")
             await asyncio.sleep(10)
         except:
             await asyncio.sleep(5)
@@ -69,7 +59,7 @@ async def send_start(client: Client, message: Message):
     reply_markup = InlineKeyboardMarkup(buttons)
     await client.send_message(
         chat_id=message.chat.id, 
-        text=f"<b>👋 Hi {message.from_user.mention}, I am Save Restricted Content Bot, I can send you restricted content by its post link.\n\nFor downloading restricted content /login first.\n\nKnow how to use bot by - /help</b>", 
+        text=f"<b>👋 Hi {message.from_user.mention}, I am Save Restricted Content Bot, I can download restricted content by its post link to local storage.\n\nFor downloading restricted content /login first.\n\nKnow how to use bot by - /help</b>", 
         reply_markup=reply_markup, 
         reply_to_message_id=message.id
     )
@@ -106,6 +96,12 @@ async def save(client: Client, message: Message):
         except:
             toID = fromID
         batch_temp.IS_BATCH[message.from_user.id] = False
+        
+        # Create user-specific directory
+        user_dir = os.path.join(DOWNLOADS_DIR, f"user_{message.from_user.id}")
+        if not os.path.exists(user_dir):
+            os.makedirs(user_dir)
+        
         for msgid in range(fromID, toID+1):
             if batch_temp.IS_BATCH.get(message.from_user.id): break
             user_data = await db.get_session(message.from_user.id)
@@ -124,7 +120,7 @@ async def save(client: Client, message: Message):
             if "https://t.me/c/" in message.text:
                 chatid = int("-100" + datas[4])
                 try:
-                    await handle_private(client, acc, message, chatid, msgid)
+                    await handle_private(client, acc, message, chatid, msgid, user_dir)
                 except Exception as e:
                     if ERROR_MESSAGE == True:
                         await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
@@ -133,7 +129,7 @@ async def save(client: Client, message: Message):
             elif "https://t.me/b/" in message.text:
                 username = datas[4]
                 try:
-                    await handle_private(client, acc, message, username, msgid)
+                    await handle_private(client, acc, message, username, msgid, user_dir)
                 except Exception as e:
                     if ERROR_MESSAGE == True:
                         await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
@@ -148,30 +144,37 @@ async def save(client: Client, message: Message):
                     await client.send_message(message.chat.id, "The username is not occupied by anyone", reply_to_message_id=message.id)
                     return
                 try:
-                    await client.copy_message(message.chat.id, msg.chat.id, msg.id, reply_to_message_id=message.id)
-                except:
-                    try:    
-                        await handle_private(client, acc, message, username, msgid)               
-                    except Exception as e:
-                        if ERROR_MESSAGE == True:
-                            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
+                    # For public messages, we also need to handle them through handle_private to save to directory
+                    await handle_private(client, acc, message, username, msgid, user_dir)
+                except Exception as e:
+                    if ERROR_MESSAGE == True:
+                        await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
 
             # wait time
             await asyncio.sleep(3)
         batch_temp.IS_BATCH[message.from_user.id] = True
 
 
-# handle private
-async def handle_private(client: Client, acc, message: Message, chatid: int, msgid: int):
+# handle private - modified to save files to directory
+async def handle_private(client: Client, acc, message: Message, chatid: int, msgid: int, user_dir: str):
     msg: Message = await acc.get_messages(chatid, msgid)
     if msg.empty: return 
     msg_type = get_message_type(msg)
     if not msg_type: return 
     chat = message.chat.id
     if batch_temp.IS_BATCH.get(message.from_user.id): return 
+    
+    # Create timestamp for unique filenames
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
     if "Text" == msg_type:
         try:
-            await client.send_message(chat, msg.text, entities=msg.entities, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
+            # Save text to file
+            text_filename = f"text_{msgid}_{timestamp}.txt"
+            text_filepath = os.path.join(user_dir, text_filename)
+            with open(text_filepath, 'w', encoding='utf-8') as f:
+                f.write(msg.text)
+            await client.send_message(chat, f"**Text saved to:** `{text_filepath}`", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
             return 
         except Exception as e:
             if ERROR_MESSAGE == True:
@@ -187,87 +190,29 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
         if ERROR_MESSAGE == True:
             await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML) 
         return await smsg.delete()
-    if batch_temp.IS_BATCH.get(message.from_user.id): return 
-    asyncio.create_task(upstatus(client, f'{message.id}upstatus.txt', smsg, chat))
-
-    if msg.caption:
-        caption = msg.caption
-    else:
-        caption = None
-    if batch_temp.IS_BATCH.get(message.from_user.id): return 
-            
-    if "Document" == msg_type:
-        try:
-            ph_path = await acc.download_media(msg.document.thumbs[0].file_id)
-        except:
-            ph_path = None
-        
-        try:
-            await client.send_document(chat, file, thumb=ph_path, caption=caption, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML, progress=progress, progress_args=[message,"up"])
-        except Exception as e:
-            if ERROR_MESSAGE == True:
-                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
-        if ph_path != None: os.remove(ph_path)
-        
-
-    elif "Video" == msg_type:
-        try:
-            ph_path = await acc.download_media(msg.video.thumbs[0].file_id)
-        except:
-            ph_path = None
-        
-        try:
-            await client.send_video(chat, file, duration=msg.video.duration, width=msg.video.width, height=msg.video.height, thumb=ph_path, caption=caption, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML, progress=progress, progress_args=[message,"up"])
-        except Exception as e:
-            if ERROR_MESSAGE == True:
-                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
-        if ph_path != None: os.remove(ph_path)
-
-    elif "Animation" == msg_type:
-        try:
-            await client.send_animation(chat, file, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
-        except Exception as e:
-            if ERROR_MESSAGE == True:
-                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
-        
-    elif "Sticker" == msg_type:
-        try:
-            await client.send_sticker(chat, file, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
-        except Exception as e:
-            if ERROR_MESSAGE == True:
-                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)     
-
-    elif "Voice" == msg_type:
-        try:
-            await client.send_voice(chat, file, caption=caption, caption_entities=msg.caption_entities, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML, progress=progress, progress_args=[message,"up"])
-        except Exception as e:
-            if ERROR_MESSAGE == True:
-                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
-
-    elif "Audio" == msg_type:
-        try:
-            ph_path = await acc.download_media(msg.audio.thumbs[0].file_id)
-        except:
-            ph_path = None
-
-        try:
-            await client.send_audio(chat, file, thumb=ph_path, caption=caption, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML, progress=progress, progress_args=[message,"up"])   
-        except Exception as e:
-            if ERROR_MESSAGE == True:
-                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
-        
-        if ph_path != None: os.remove(ph_path)
-
-    elif "Photo" == msg_type:
-        try:
-            await client.send_photo(chat, file, caption=caption, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
-        except:
-            if ERROR_MESSAGE == True:
-                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
     
-    if os.path.exists(f'{message.id}upstatus.txt'): 
-        os.remove(f'{message.id}upstatus.txt')
-        os.remove(file)
+    if batch_temp.IS_BATCH.get(message.from_user.id): return 
+
+    # Move downloaded file to user directory with organized naming
+    if file:
+        original_filename = os.path.basename(file)
+        file_extension = os.path.splitext(original_filename)[1]
+        new_filename = f"{msg_type.lower()}_{msgid}_{timestamp}{file_extension}"
+        new_filepath = os.path.join(user_dir, new_filename)
+        
+        # Move file to user directory
+        shutil.move(file, new_filepath)
+        
+        # Save caption if exists
+        if msg.caption:
+            caption_filename = f"{msg_type.lower()}_{msgid}_{timestamp}_caption.txt"
+            caption_filepath = os.path.join(user_dir, caption_filename)
+            with open(caption_filepath, 'w', encoding='utf-8') as f:
+                f.write(msg.caption)
+        
+        # Send confirmation message
+        await client.send_message(chat, f"**File saved to:** `{new_filepath}`", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
+    
     await client.delete_messages(message.chat.id,[smsg.id])
 
 
@@ -320,4 +265,3 @@ def get_message_type(msg: pyrogram.types.messages_and_media.message.Message):
         return "Text"
     except:
         pass
-        
