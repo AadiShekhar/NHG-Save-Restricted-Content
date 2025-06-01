@@ -176,42 +176,45 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
     smsg = await client.send_message(message.chat.id, '**Downloading**', reply_to_message_id=message.id)
     asyncio.create_task(downstatus(client, f'{message.id}downstatus.txt', smsg, chat))
     try:
-        file = await acc.download_media(msg, progress=progress, progress_args=[message,"down"])
-        os.remove(f'{message.id}downstatus.txt')
+        # Download to downloads directory directly
+        file = await acc.download_media(msg, file_name=DOWNLOADS_DIR, progress=progress, progress_args=[message,"down"])
+        if os.path.exists(f'{message.id}downstatus.txt'):
+            os.remove(f'{message.id}downstatus.txt')
     except Exception as e:
+        if os.path.exists(f'{message.id}downstatus.txt'):
+            os.remove(f'{message.id}downstatus.txt')
         if ERROR_MESSAGE == True:
-            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML) 
+            await client.send_message(message.chat.id, f"Download Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML) 
         return await smsg.delete()
     
     if batch_temp.IS_BATCH.get(message.from_user.id): return 
 
-    # Move downloaded file to downloads directory with original filename (NO _1 suffix)
-    if file:
-        original_filename = os.path.basename(file)
-        new_filepath = os.path.join(DOWNLOADS_DIR, original_filename)
-        
-        # If file exists, overwrite it (no counter added)
-        if os.path.exists(new_filepath):
-            os.remove(new_filepath)  # Remove existing file
-        
-        # Move file to downloads directory
-        shutil.move(file, new_filepath)
-        
-        # Save caption if exists
-        if msg.caption:
-            base_name, extension = os.path.splitext(original_filename)
-            caption_filename = f"{base_name}_caption.txt"
-            caption_filepath = os.path.join(DOWNLOADS_DIR, caption_filename)
+    # Handle downloaded file
+    if file and os.path.exists(file):
+        try:
+            # Save caption if exists
+            if msg.caption:
+                original_filename = os.path.basename(file)
+                base_name, extension = os.path.splitext(original_filename)
+                caption_filename = f"{base_name}_caption.txt"
+                caption_filepath = os.path.join(DOWNLOADS_DIR, caption_filename)
+                
+                # If caption file exists, overwrite it (no counter added)
+                if os.path.exists(caption_filepath):
+                    os.remove(caption_filepath)  # Remove existing caption file
+                
+                with open(caption_filepath, 'w', encoding='utf-8') as f:
+                    f.write(msg.caption)
             
-            # If caption file exists, overwrite it (no counter added)
-            if os.path.exists(caption_filepath):
-                os.remove(caption_filepath)  # Remove existing caption file
+            # Send confirmation message
+            await client.send_message(chat, f"**File saved to:** `{file}`", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
             
-            with open(caption_filepath, 'w', encoding='utf-8') as f:
-                f.write(msg.caption)
-        
-        # Send confirmation message
-        await client.send_message(chat, f"**File saved to:** `{new_filepath}`", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
+        except Exception as e:
+            if ERROR_MESSAGE == True:
+                await client.send_message(message.chat.id, f"Error saving caption: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
+    else:
+        if ERROR_MESSAGE == True:
+            await client.send_message(message.chat.id, f"Downloaded file not found or failed", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
     
     await client.delete_messages(message.chat.id,[smsg.id])
 
