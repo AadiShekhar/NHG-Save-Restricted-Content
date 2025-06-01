@@ -45,6 +45,26 @@ def progress(current, total, message, type):
         fileup.write(f"{current * 100 / total:.1f}%")
 
 
+# File extension helper function
+def get_file_extension(msg: pyrogram.types.Message):
+    if msg.document:
+        return os.path.splitext(msg.document.file_name)[1]
+    elif msg.video:
+        return ".mp4"
+    elif msg.audio:
+        return ".mp3"
+    elif msg.voice:
+        return ".ogg"
+    elif msg.photo:
+        return ".jpg"
+    elif msg.sticker:
+        return ".webp"
+    elif msg.animation:
+        return ".gif"
+    else:
+        return ""
+
+
 # start command
 @Client.on_message(filters.command(["start"]))
 async def send_start(client: Client, message: Message):
@@ -150,7 +170,7 @@ async def save(client: Client, message: Message):
         batch_temp.IS_BATCH[message.from_user.id] = True
 
 
-# handle private - modified to save files without _1 suffix
+# Fixed handle_private function
 async def handle_private(client: Client, acc, message: Message, chatid: int, msgid: int):
     msg: Message = await acc.get_messages(chatid, msgid)
     if msg.empty: return 
@@ -175,11 +195,24 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
 
     smsg = await client.send_message(message.chat.id, '**Downloading**', reply_to_message_id=message.id)
     asyncio.create_task(downstatus(client, f'{message.id}downstatus.txt', smsg, chat))
+    
     try:
-        # Download to downloads directory directly
-        file = await acc.download_media(msg, file_name=DOWNLOADS_DIR, progress=progress, progress_args=[message,"down"])
+        # Generate proper filename with extension
+        file_ext = get_file_extension(msg)
+        filename = f"{msgid}{file_ext}"
+        file_path = os.path.join(DOWNLOADS_DIR, filename)
+        
+        # Download directly to the correct path
+        file = await acc.download_media(
+            msg, 
+            file_name=file_path,
+            progress=progress,
+            progress_args=[message, "down"]
+        )
+        
         if os.path.exists(f'{message.id}downstatus.txt'):
             os.remove(f'{message.id}downstatus.txt')
+            
     except Exception as e:
         if os.path.exists(f'{message.id}downstatus.txt'):
             os.remove(f'{message.id}downstatus.txt')
@@ -189,34 +222,22 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
     
     if batch_temp.IS_BATCH.get(message.from_user.id): return 
 
-    # Handle downloaded file
-    if file and os.path.exists(file):
-        try:
-            # Save caption if exists
-            if msg.caption:
-                original_filename = os.path.basename(file)
-                base_name, extension = os.path.splitext(original_filename)
-                caption_filename = f"{base_name}_caption.txt"
-                caption_filepath = os.path.join(DOWNLOADS_DIR, caption_filename)
-                
-                # If caption file exists, overwrite it (no counter added)
-                if os.path.exists(caption_filepath):
-                    os.remove(caption_filepath)  # Remove existing caption file
-                
-                with open(caption_filepath, 'w', encoding='utf-8') as f:
-                    f.write(msg.caption)
+    # Handle caption saving
+    try:
+        if msg.caption:
+            base_name = os.path.splitext(filename)[0]
+            caption_filename = f"{base_name}_caption.txt"
+            caption_filepath = os.path.join(DOWNLOADS_DIR, caption_filename)
             
-            # Send confirmation message
-            await client.send_message(chat, f"**File saved to:** `{file}`", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
-            
-        except Exception as e:
-            if ERROR_MESSAGE == True:
-                await client.send_message(message.chat.id, f"Error saving caption: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
-    else:
+            with open(caption_filepath, 'w', encoding='utf-8') as f:
+                f.write(msg.caption)
+    except Exception as e:
         if ERROR_MESSAGE == True:
-            await client.send_message(message.chat.id, f"Downloaded file not found or failed", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
-    
-    await client.delete_messages(message.chat.id,[smsg.id])
+            await client.send_message(message.chat.id, f"Error saving caption: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
+
+    # Send success message
+    await client.send_message(chat, f"**File saved to:** `{file_path}`", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
+    await client.delete_messages(message.chat.id, [smsg.id])
 
 
 # get the type of message
