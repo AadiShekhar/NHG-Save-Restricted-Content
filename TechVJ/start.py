@@ -13,6 +13,7 @@ from database.db import db
 from TechVJ.strings import HELP_TXT
 import shutil
 from datetime import datetime
+import re
 
 # Create downloads directory
 DOWNLOADS_DIR = "downloads"
@@ -45,24 +46,59 @@ def progress(current, total, message, type):
         fileup.write(f"{current * 100 / total:.1f}%")
 
 
-# File extension helper function
-def get_file_extension(msg: pyrogram.types.Message):
+# File info helper function
+def get_file_info(msg: pyrogram.types.Message, msgid: int):
+    # Clean filename helper
+    def clean_filename(text):
+        return re.sub(r'[\\/*?:"<>|]', "", text).strip()
+    
+    file_info = {"ext": "", "name": "", "original": ""}
+    
     if msg.document:
-        return os.path.splitext(msg.document.file_name)[1]
+        file_info["ext"] = os.path.splitext(msg.document.file_name or "")[1] or ".bin"
+        file_info["original"] = msg.document.file_name or f"document_{msgid}{file_info['ext']}"
+        file_info["name"] = clean_filename(f"{msgid}_{file_info['original']}")
     elif msg.video:
-        return ".mp4"
+        file_info["ext"] = ".mp4"
+        file_info["original"] = msg.video.file_name or f"video_{msgid}.mp4"
+        file_info["name"] = clean_filename(f"{msgid}_{file_info['original']}")
     elif msg.audio:
-        return ".mp3"
+        file_info["ext"] = ".mp3"
+        if msg.audio.title and msg.audio.performer:
+            title = clean_filename(msg.audio.title)
+            artist = clean_filename(msg.audio.performer)
+            file_info["original"] = f"{artist} - {title}.mp3"
+        else:
+            file_info["original"] = msg.audio.file_name or f"audio_{msgid}.mp3"
+        file_info["name"] = clean_filename(f"{msgid}_{file_info['original']}")
     elif msg.voice:
-        return ".ogg"
+        file_info["ext"] = ".ogg"
+        file_info["original"] = f"voice_message_{msgid}.ogg"
+        file_info["name"] = f"{msgid}_voice.ogg"
     elif msg.photo:
-        return ".jpg"
+        file_info["ext"] = ".jpg"
+        file_info["original"] = f"photo_{msgid}.jpg"
+        file_info["name"] = f"{msgid}_photo.jpg"
     elif msg.sticker:
-        return ".webp"
+        file_info["ext"] = ".webp" if not msg.sticker.is_animated else ".tgs"
+        file_info["original"] = f"sticker_{msgid}{file_info['ext']}"
+        file_info["name"] = f"{msgid}_sticker{file_info['ext']}"
     elif msg.animation:
-        return ".gif"
-    else:
-        return ""
+        file_info["ext"] = ".gif"
+        file_info["original"] = msg.animation.file_name or f"animation_{msgid}.gif"
+        file_info["name"] = clean_filename(f"{msgid}_{file_info['original']}")
+    elif msg.video_note:
+        file_info["ext"] = ".mp4"
+        file_info["original"] = f"video_note_{msgid}.mp4"
+        file_info["name"] = f"{msgid}_video_note.mp4"
+    
+    # Fallback for unknown types
+    if not file_info["ext"]:
+        file_info["ext"] = ".bin"
+        file_info["original"] = f"file_{msgid}.bin"
+        file_info["name"] = f"{msgid}_file.bin"
+    
+    return file_info
 
 
 # start command
@@ -159,7 +195,6 @@ async def save(client: Client, message: Message):
                     await client.send_message(message.chat.id, "The username is not occupied by anyone", reply_to_message_id=message.id)
                     return
                 try:
-                    # For public messages, we also need to handle them through handle_private to save to directory
                     await handle_private(client, acc, message, username, msgid)
                 except Exception as e:
                     if ERROR_MESSAGE == True:
@@ -170,7 +205,7 @@ async def save(client: Client, message: Message):
         batch_temp.IS_BATCH[message.from_user.id] = True
 
 
-# Fixed handle_private function
+# Enhanced handle_private function with proper filename handling
 async def handle_private(client: Client, acc, message: Message, chatid: int, msgid: int):
     msg: Message = await acc.get_messages(chatid, msgid)
     if msg.empty: return 
@@ -181,63 +216,93 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
     
     if "Text" == msg_type:
         try:
-            # Save text to file with message ID as filename
             text_filename = f"text_message_{msgid}.txt"
             text_filepath = os.path.join(DOWNLOADS_DIR, text_filename)
             with open(text_filepath, 'w', encoding='utf-8') as f:
-                f.write(msg.text)
-            await client.send_message(chat, f"**Text saved to:** `{text_filepath}`", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
+                f.write(msg.text or msg.caption or "")
+            await client.send_message(chat, f"**Text saved to:** `{text_filepath}`", reply_to_message_id=message.id)
             return 
         except Exception as e:
-            if ERROR_MESSAGE == True:
-                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
+            if ERROR_MESSAGE:
+                await client.send_message(chat, f"Error: {e}", reply_to_message_id=message.id)
             return 
 
-    smsg = await client.send_message(message.chat.id, '**Downloading**', reply_to_message_id=message.id)
+    smsg = await client.send_message(chat, '**Downloading...**', reply_to_message_id=message.id)
     asyncio.create_task(downstatus(client, f'{message.id}downstatus.txt', smsg, chat))
     
     try:
-        # Generate proper filename with extension
-        file_ext = get_file_extension(msg)
-        filename = f"{msgid}{file_ext}"
-        file_path = os.path.join(DOWNLOADS_DIR, filename)
+        # Get proper file information
+        file_info = get_file_info(msg, msgid)
         
-        # Download directly to the correct path
-        file = await acc.download_media(
+        # Create safe filename
+        file_path = os.path.join(DOWNLOADS_DIR, file_info["name"])
+        
+        # Ensure unique filename
+        counter = 1
+        base_name, ext = os.path.splitext(file_info["name"])
+        while os.path.exists(file_path):
+            file_path = os.path.join(DOWNLOADS_DIR, f"{base_name}_{counter}{ext}")
+            counter += 1
+        
+        # Download with progress
+        dl_path = await acc.download_media(
             msg, 
             file_name=file_path,
             progress=progress,
             progress_args=[message, "down"]
         )
         
+        if not dl_path or not os.path.exists(dl_path):
+            raise Exception("Download failed - file not created")
+            
         if os.path.exists(f'{message.id}downstatus.txt'):
             os.remove(f'{message.id}downstatus.txt')
             
     except Exception as e:
         if os.path.exists(f'{message.id}downstatus.txt'):
             os.remove(f'{message.id}downstatus.txt')
-        if ERROR_MESSAGE == True:
-            await client.send_message(message.chat.id, f"Download Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML) 
+        if ERROR_MESSAGE:
+            await client.send_message(chat, f"⚠️ **Download Failed**\n\nError: `{e}`", reply_to_message_id=message.id) 
         return await smsg.delete()
     
-    if batch_temp.IS_BATCH.get(message.from_user.id): return 
+    if batch_temp.IS_BATCH.get(message.from_user.id): 
+        return
 
     # Handle caption saving
-    try:
-        if msg.caption:
-            base_name = os.path.splitext(filename)[0]
+    caption_text = msg.caption or ""
+    if caption_text:
+        try:
+            base_name = os.path.splitext(file_info["name"])[0]
             caption_filename = f"{base_name}_caption.txt"
             caption_filepath = os.path.join(DOWNLOADS_DIR, caption_filename)
             
+            # Ensure unique caption filename
+            cap_counter = 1
+            while os.path.exists(caption_filepath):
+                caption_filepath = os.path.join(DOWNLOADS_DIR, f"{base_name}_caption_{cap_counter}.txt")
+                cap_counter += 1
+            
             with open(caption_filepath, 'w', encoding='utf-8') as f:
-                f.write(msg.caption)
-    except Exception as e:
-        if ERROR_MESSAGE == True:
-            await client.send_message(message.chat.id, f"Error saving caption: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
+                f.write(caption_text)
+        except Exception as e:
+            if ERROR_MESSAGE:
+                await client.send_message(chat, f"⚠️ **Caption Save Failed**\n\nError: `{e}`", reply_to_message_id=message.id)
 
     # Send success message
-    await client.send_message(chat, f"**File saved to:** `{file_path}`", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
-    await client.delete_messages(message.chat.id, [smsg.id])
+    file_size = os.path.getsize(dl_path)
+    size_str = f"{file_size/1024:.1f} KB" if file_size < 1024*1024 else f"{file_size/(1024*1024):.1f} MB"
+    
+    await client.send_message(
+        chat, 
+        f"✅ **Saved Successfully!**\n\n"
+        f"• **Original Name:** `{file_info['original']}`\n"
+        f"• **Saved As:** `{os.path.basename(dl_path)}`\n"
+        f"• **Type:** `{msg_type}`\n"
+        f"• **Size:** {size_str}\n"
+        f"• **Saved Path:** `{dl_path}`",
+        reply_to_message_id=message.id
+    )
+    await client.delete_messages(chat, [smsg.id])
 
 
 # get the type of message
@@ -285,7 +350,15 @@ def get_message_type(msg: pyrogram.types.messages_and_media.message.Message):
         pass
 
     try:
-        msg.text
-        return "Text"
+        msg.video_note.file_id
+        return "Video Note"
     except:
         pass
+
+    try:
+        if msg.text:
+            return "Text"
+    except:
+        pass
+    
+    return "Unknown"
