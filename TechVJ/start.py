@@ -97,11 +97,6 @@ async def save(client: Client, message: Message):
             toID = fromID
         batch_temp.IS_BATCH[message.from_user.id] = False
         
-        # Create user-specific directory
-        user_dir = os.path.join(DOWNLOADS_DIR, f"user_{message.from_user.id}")
-        if not os.path.exists(user_dir):
-            os.makedirs(user_dir)
-        
         for msgid in range(fromID, toID+1):
             if batch_temp.IS_BATCH.get(message.from_user.id): break
             user_data = await db.get_session(message.from_user.id)
@@ -120,7 +115,7 @@ async def save(client: Client, message: Message):
             if "https://t.me/c/" in message.text:
                 chatid = int("-100" + datas[4])
                 try:
-                    await handle_private(client, acc, message, chatid, msgid, user_dir)
+                    await handle_private(client, acc, message, chatid, msgid)
                 except Exception as e:
                     if ERROR_MESSAGE == True:
                         await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
@@ -129,7 +124,7 @@ async def save(client: Client, message: Message):
             elif "https://t.me/b/" in message.text:
                 username = datas[4]
                 try:
-                    await handle_private(client, acc, message, username, msgid, user_dir)
+                    await handle_private(client, acc, message, username, msgid)
                 except Exception as e:
                     if ERROR_MESSAGE == True:
                         await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
@@ -145,7 +140,7 @@ async def save(client: Client, message: Message):
                     return
                 try:
                     # For public messages, we also need to handle them through handle_private to save to directory
-                    await handle_private(client, acc, message, username, msgid, user_dir)
+                    await handle_private(client, acc, message, username, msgid)
                 except Exception as e:
                     if ERROR_MESSAGE == True:
                         await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
@@ -156,7 +151,7 @@ async def save(client: Client, message: Message):
 
 
 # handle private - modified to save files to directory
-async def handle_private(client: Client, acc, message: Message, chatid: int, msgid: int, user_dir: str):
+async def handle_private(client: Client, acc, message: Message, chatid: int, msgid: int):
     msg: Message = await acc.get_messages(chatid, msgid)
     if msg.empty: return 
     msg_type = get_message_type(msg)
@@ -164,14 +159,11 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
     chat = message.chat.id
     if batch_temp.IS_BATCH.get(message.from_user.id): return 
     
-    # Create timestamp for unique filenames
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
     if "Text" == msg_type:
         try:
-            # Save text to file
-            text_filename = f"text_{msgid}_{timestamp}.txt"
-            text_filepath = os.path.join(user_dir, text_filename)
+            # Save text to file with message ID as filename
+            text_filename = f"text_message_{msgid}.txt"
+            text_filepath = os.path.join(DOWNLOADS_DIR, text_filename)
             with open(text_filepath, 'w', encoding='utf-8') as f:
                 f.write(msg.text)
             await client.send_message(chat, f"**Text saved to:** `{text_filepath}`", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
@@ -193,20 +185,33 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
     
     if batch_temp.IS_BATCH.get(message.from_user.id): return 
 
-    # Move downloaded file to user directory with organized naming
+    # Move downloaded file to downloads directory with original filename
     if file:
         original_filename = os.path.basename(file)
-        file_extension = os.path.splitext(original_filename)[1]
-        new_filename = f"{msg_type.lower()}_{msgid}_{timestamp}{file_extension}"
-        new_filepath = os.path.join(user_dir, new_filename)
+        new_filepath = os.path.join(DOWNLOADS_DIR, original_filename)
         
-        # Move file to user directory
+        # Handle duplicate filenames by adding a counter
+        counter = 1
+        base_name, extension = os.path.splitext(original_filename)
+        while os.path.exists(new_filepath):
+            new_filename = f"{base_name}_{counter}{extension}"
+            new_filepath = os.path.join(DOWNLOADS_DIR, new_filename)
+            counter += 1
+        
+        # Move file to downloads directory
         shutil.move(file, new_filepath)
         
         # Save caption if exists
         if msg.caption:
-            caption_filename = f"{msg_type.lower()}_{msgid}_{timestamp}_caption.txt"
-            caption_filepath = os.path.join(user_dir, caption_filename)
+            caption_filename = f"{base_name}_caption.txt"
+            caption_filepath = os.path.join(DOWNLOADS_DIR, caption_filename)
+            # Handle duplicate caption files
+            counter = 1
+            while os.path.exists(caption_filepath):
+                caption_filename = f"{base_name}_caption_{counter}.txt"
+                caption_filepath = os.path.join(DOWNLOADS_DIR, caption_filename)
+                counter += 1
+            
             with open(caption_filepath, 'w', encoding='utf-8') as f:
                 f.write(msg.caption)
         
