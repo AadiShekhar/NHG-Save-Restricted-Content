@@ -150,7 +150,7 @@ async def save(client: Client, message: Message):
         batch_temp.IS_BATCH[message.from_user.id] = True
 
 
-# handle private - modified to save files to directory
+# handle private - modified to save files without _1 suffix
 async def handle_private(client: Client, acc, message: Message, chatid: int, msgid: int):
     msg: Message = await acc.get_messages(chatid, msgid)
     if msg.empty: return 
@@ -185,32 +185,27 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
     
     if batch_temp.IS_BATCH.get(message.from_user.id): return 
 
-    # Move downloaded file to downloads directory with original filename
+    # Move downloaded file to downloads directory with original filename (NO _1 suffix)
     if file:
         original_filename = os.path.basename(file)
         new_filepath = os.path.join(DOWNLOADS_DIR, original_filename)
         
-        # Handle duplicate filenames by adding a counter
-        counter = 1
-        base_name, extension = os.path.splitext(original_filename)
-        while os.path.exists(new_filepath):
-            new_filename = f"{base_name}_{counter}{extension}"
-            new_filepath = os.path.join(DOWNLOADS_DIR, new_filename)
-            counter += 1
+        # If file exists, overwrite it (no counter added)
+        if os.path.exists(new_filepath):
+            os.remove(new_filepath)  # Remove existing file
         
         # Move file to downloads directory
         shutil.move(file, new_filepath)
         
         # Save caption if exists
         if msg.caption:
+            base_name, extension = os.path.splitext(original_filename)
             caption_filename = f"{base_name}_caption.txt"
             caption_filepath = os.path.join(DOWNLOADS_DIR, caption_filename)
-            # Handle duplicate caption files
-            counter = 1
-            while os.path.exists(caption_filepath):
-                caption_filename = f"{base_name}_caption_{counter}.txt"
-                caption_filepath = os.path.join(DOWNLOADS_DIR, caption_filename)
-                counter += 1
+            
+            # If caption file exists, overwrite it (no counter added)
+            if os.path.exists(caption_filepath):
+                os.remove(caption_filepath)  # Remove existing caption file
             
             with open(caption_filepath, 'w', encoding='utf-8') as f:
                 f.write(msg.caption)
