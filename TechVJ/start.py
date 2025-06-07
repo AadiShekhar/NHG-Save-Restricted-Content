@@ -4,6 +4,7 @@
 
 import os
 import asyncio 
+import time
 import pyrogram
 from pyrogram import Client, filters, enums
 from pyrogram.errors import FloodWait, UserIsBlocked, InputUserDeactivated, UserAlreadyParticipant, InviteHashExpired, UsernameNotOccupied
@@ -413,8 +414,6 @@ async def process_message_batch(
                 summary += f"- {result['original']} ({file_size})\n"
     
     await message.reply(summary)
-    else:
-        await message.reply("⚠️ **No files were downloaded successfully.**")
 
 @Client.on_message(filters.command(["start"]))
 async def send_start(client: Client, message: Message):
@@ -476,8 +475,8 @@ async def save(client: Client, message: Message):
         to_id = from_id
 
     msg_ids = list(range(from_id, to_id + 1))
-    if len(msg_ids) > 100:
-        return await message.reply("**Batch size too large. Maximum 100 messages per batch.**")
+    if len(msg_ids) > MAX_BATCH_SIZE:
+        return await message.reply(f"**Batch size too large. Maximum {MAX_BATCH_SIZE} messages per batch.**")
 
     # Determine chat ID based on URL type
     if "https://t.me/c/" in message.text:  # Private
