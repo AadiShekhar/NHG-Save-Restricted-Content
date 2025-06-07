@@ -14,30 +14,28 @@ from TechVJ.strings import HELP_TXT
 import shutil
 from datetime import datetime
 import re
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 # Constants
-MAX_PARALLEL_DOWNLOADS = 5  # Number of simultaneous downloads
-DOWNLOAD_TIMEOUT = 300  # 5 minutes timeout per download
-STATUS_UPDATE_INTERVAL = 5  # Seconds between status updates
-
-# Create downloads directory
-DOWNLOADS_DIR = "downloads"
-if not os.path.exists(DOWNLOADS_DIR):
-    os.makedirs(DOWNLOADS_DIR)
+MAX_PARALLEL_DOWNLOADS = 3  # Reduced for better stability with large files
+DOWNLOAD_TIMEOUT = 900  # 15 minutes timeout for large files
+STATUS_UPDATE_INTERVAL = 10  # Seconds between status updates
+MAX_BATCH_SIZE = 50  # Maximum messages per batch
+FLOOD_WAIT_THRESHOLD = 5  # Seconds after which we show flood wait warning
 
 class BatchStatus:
     def __init__(self):
         self.active_batches: Dict[int, bool] = {}
         self.download_tasks: Dict[int, List[asyncio.Task]] = {}
         self.status_messages: Dict[int, Message] = {}
-        self.progress: Dict[int, Dict[str, float]] = {}
+        self.progress: Dict[int, Dict[str, Tuple[float, str]]] = {}  # (progress, status)
+        self.last_flood_wait: Dict[int, float] = {}
 
     def is_batch_active(self, user_id: int) -> bool:
-        return self.active_batches.get(user_id, True)
+        return not self.active_batches.get(user_id, True)
     
     def set_batch_status(self, user_id: int, status: bool):
-        self.active_batches[user_id] = status
+        self.active_batches[user_id] = not status
         
     def add_download_task(self, user_id: int, task: asyncio.Task):
         if user_id not in self.download_tasks:
@@ -47,26 +45,53 @@ class BatchStatus:
     def cancel_all_tasks(self, user_id: int):
         if user_id in self.download_tasks:
             for task in self.download_tasks[user_id]:
-                task.cancel()
+                if not task.done():
+                    task.cancel()
             self.download_tasks[user_id] = []
             
-    def update_progress(self, user_id: int, msg_id: int, progress: float):
+    def update_progress(self, user_id: int, msg_id: int, progress: float, status: str = "Downloading"):
         if user_id not in self.progress:
             self.progress[user_id] = {}
-        self.progress[user_id][msg_id] = progress
+        self.progress[user_id][msg_id] = (progress, status)
         
-    def get_progress(self, user_id: int) -> Dict[int, float]:
+    def get_progress(self, user_id: int) -> Dict[int, Tuple[float, str]]:
         return self.progress.get(user_id, {})
+    
+    def record_flood_wait(self, user_id: int, wait_time: float):
+        self.last_flood_wait[user_id] = wait_time
 
 batch_status = BatchStatus()
 
-async def download_status_updater(client: Client, user_id: int, chat_id: int):
+async def download_status_updater(client: Client, user_id: int, chat_id: int, start_msg: Message):
+    last_update = 0
+    flood_wait_warning_sent = False
+    
     while not batch_status.is_batch_active(user_id) and user_id in batch_status.status_messages:
+        current_time = time.time()
         progress = batch_status.get_progress(user_id)
+        
+        # Check for recent flood wait
+        last_flood = batch_status.last_flood_wait.get(user_id, 0)
+        if last_flood >= FLOOD_WAIT_THRESHOLD and not flood_wait_warning_sent:
+            await client.send_message(
+                chat_id,
+                f"⚠️ **Slowing down downloads due to Telegram rate limits**\n\n"
+                f"The bot is automatically adjusting download speed to avoid restrictions.",
+                reply_to_message_id=start_msg.id
+            )
+            flood_wait_warning_sent = True
+        
         if progress:
-            status_text = "**Download Progress:**\n\n"
-            for msg_id, percent in progress.items():
-                status_text += f"• Message {msg_id}: {percent:.1f}%\n"
+            status_text = "**Download Progress**\n\n"
+            completed = 0
+            total = len(progress)
+            
+            for msg_id, (percent, status) in progress.items():
+                if percent >= 100:
+                    completed += 1
+                status_text += f"• {msg_id}: {status} ({percent:.1f}%)\n"
+            
+            status_text += f"\n**Completed:** {completed}/{total}"
             
             try:
                 await batch_status.status_messages[user_id].edit_text(status_text)
@@ -149,10 +174,12 @@ async def download_file(
     try:
         msg = await acc.get_messages(chat_id, msg_id)
         if msg.empty:
+            batch_status.update_progress(user_id, msg_id, 0, "Message not found")
             return None
 
         msg_type = get_message_type(msg)
         if not msg_type or msg_type == "Unknown":
+            batch_status.update_progress(user_id, msg_id, 0, "Unsupported type")
             return None
 
         if msg_type == "Text":
@@ -160,6 +187,7 @@ async def download_file(
             text_filepath = os.path.join(DOWNLOADS_DIR, text_filename)
             with open(text_filepath, 'w', encoding='utf-8') as f:
                 f.write(msg.text or msg.caption or "")
+            batch_status.update_progress(user_id, msg_id, 100, "Completed")
             return {
                 "type": "text",
                 "path": text_filepath,
@@ -181,45 +209,76 @@ async def download_file(
         # Download with progress
         def progress(current, total):
             percent = current * 100 / total
-            batch_status.update_progress(user_id, msg_id, percent)
+            batch_status.update_progress(user_id, msg_id, percent, "Downloading")
 
-        dl_path = await asyncio.wait_for(
-            acc.download_media(
-                msg,
-                file_name=file_path,
-                progress=progress
-            ),
-            timeout=DOWNLOAD_TIMEOUT
-        )
+        batch_status.update_progress(user_id, msg_id, 0, "Starting download")
+        
+        try:
+            dl_path = await asyncio.wait_for(
+                acc.download_media(
+                    msg,
+                    file_name=file_path,
+                    progress=progress
+                ),
+                timeout=DOWNLOAD_TIMEOUT
+            )
+        except FloodWait as e:
+            batch_status.record_flood_wait(user_id, e.value)
+            batch_status.update_progress(user_id, msg_id, 0, f"Waiting {e.value}s")
+            await asyncio.sleep(e.value)
+            return await download_file(client, acc, message, chat_id, msg_id, user_id)
+        except asyncio.TimeoutError:
+            batch_status.update_progress(user_id, msg_id, 0, "Timeout")
+            if ERROR_MESSAGE:
+                await client.send_message(
+                    message.chat.id,
+                    f"⚠️ **Download Timeout**\n\nMessage ID: {msg_id}",
+                    reply_to_message_id=message.id
+                )
+            return None
+        except Exception as e:
+            batch_status.update_progress(user_id, msg_id, 0, f"Error: {str(e)}")
+            if ERROR_MESSAGE:
+                await client.send_message(
+                    message.chat.id,
+                    f"⚠️ **Download Failed**\n\nMessage ID: {msg_id}\nError: `{e}`",
+                    reply_to_message_id=message.id
+                )
+            return None
 
         if not dl_path or not os.path.exists(dl_path):
+            batch_status.update_progress(user_id, msg_id, 0, "Download failed")
             raise Exception("Download failed - file not created")
 
         file_size = os.path.getsize(dl_path)
+        batch_status.update_progress(user_id, msg_id, 100, "Completed")
+        
+        # Save caption if exists
+        caption_path = None
+        if msg.caption:
+            caption_filename = f"{os.path.splitext(file_info['name'])[0]}_caption.txt"
+            caption_path = os.path.join(DOWNLOADS_DIR, caption_filename)
+            with open(caption_path, 'w', encoding='utf-8') as f:
+                f.write(msg.caption)
         
         return {
             "type": msg_type.lower(),
             "path": dl_path,
             "original": file_info["original"],
             "size": file_size,
-            "caption": msg.caption or ""
+            "caption": msg.caption or "",
+            "caption_path": caption_path
         }
 
-    except asyncio.TimeoutError:
-        if ERROR_MESSAGE:
-            await client.send_message(
-                message.chat.id,
-                f"⚠️ **Download Timeout**\n\nMessage ID: {msg_id}",
-                reply_to_message_id=message.id
-            )
     except Exception as e:
+        batch_status.update_progress(user_id, msg_id, 0, f"Error: {str(e)}")
         if ERROR_MESSAGE:
             await client.send_message(
                 message.chat.id,
-                f"⚠️ **Download Failed**\n\nMessage ID: {msg_id}\nError: `{e}`",
+                f"⚠️ **Error Processing Message**\n\nID: {msg_id}\nError: `{e}`",
                 reply_to_message_id=message.id
             )
-    return None
+        return None
 
 async def process_message_batch(
     client: Client,
@@ -229,11 +288,17 @@ async def process_message_batch(
     user_data: str
 ):
     user_id = message.from_user.id
+    
+    # Check if already in a batch
+    if not batch_status.is_batch_active(user_id):
+        return await message.reply("Another batch is already in progress. Wait or use /cancel.")
+
     batch_status.set_batch_status(user_id, False)
+    batch_status.cancel_all_tasks(user_id)  # Clear any previous tasks
     
     try:
         acc = Client("saverestricted", session_string=user_data, api_hash=API_HASH, api_id=API_ID)
-        await acc.connect()
+        await acc.start()
     except Exception as e:
         batch_status.set_batch_status(user_id, True)
         return await message.reply(f"**Session Error:** `{e}`\n\n/logout and /login again.")
@@ -241,18 +306,23 @@ async def process_message_batch(
     # Create status message
     status_msg = await client.send_message(
         message.chat.id,
-        "🔄 **Starting batch download...**",
+        "🔄 **Starting batch download...**\n\n"
+        f"• Total Messages: {len(msg_ids)}\n"
+        "• Preparing to download...",
         reply_to_message_id=message.id
     )
     batch_status.status_messages[user_id] = status_msg
     
     # Start status updater
-    asyncio.create_task(download_status_updater(client, user_id, message.chat.id))
+    status_task = asyncio.create_task(
+        download_status_updater(client, user_id, message.chat.id, message)
+    )
     
-    # Process downloads in parallel with semaphore
+    # Process downloads with limited concurrency
     semaphore = asyncio.Semaphore(MAX_PARALLEL_DOWNLOADS)
     tasks = []
     results = []
+    failed = 0
     
     async def process_single_message(msg_id: int):
         async with semaphore:
@@ -263,16 +333,20 @@ async def process_message_batch(
                 result = await download_file(client, acc, message, chat_id, msg_id, user_id)
                 if result:
                     results.append(result)
+                else:
+                    nonlocal failed
+                    failed += 1
             except Exception as e:
+                nonlocal failed
+                failed += 1
                 if ERROR_MESSAGE:
                     await client.send_message(
                         message.chat.id,
                         f"⚠️ **Error Processing Message**\n\nID: {msg_id}\nError: `{e}`",
                         reply_to_message_id=message.id
                     )
-            finally:
-                batch_status.update_progress(user_id, msg_id, 100)
 
+    # Create tasks for all messages
     for msg_id in msg_ids:
         if batch_status.is_batch_active(user_id):
             break
@@ -280,33 +354,65 @@ async def process_message_batch(
         batch_status.add_download_task(user_id, task)
         tasks.append(task)
     
-    await asyncio.gather(*tasks, return_exceptions=True)
+    # Wait for all tasks to complete
+    try:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    except Exception as e:
+        if ERROR_MESSAGE:
+            await client.send_message(
+                message.chat.id,
+                f"⚠️ **Batch Error:** `{e}`",
+                reply_to_message_id=message.id
+            )
     
     # Clean up
-    await acc.disconnect()
-    batch_status.set_batch_status(user_id, True)
+    try:
+        await acc.stop()
+    except:
+        pass
+    
+    # Cancel status updater
+    status_task.cancel()
+    try:
+        await status_task
+    except:
+        pass
     
     if user_id in batch_status.status_messages:
-        await batch_status.status_messages[user_id].delete()
+        try:
+            await batch_status.status_messages[user_id].delete()
+        except:
+            pass
         del batch_status.status_messages[user_id]
     
+    # Set batch as complete
+    batch_status.set_batch_status(user_id, True)
+    
+    # Don't show summary if batch was cancelled
     if batch_status.is_batch_active(user_id):
-        return await message.reply("**Batch download cancelled.**")
+        return
     
     # Send summary
     success_count = len(results)
+    total_count = len(msg_ids)
+    
+    summary = f"✅ **Batch Download Complete**\n\n"
+    summary += f"• Total Messages: {total_count}\n"
+    summary += f"• Successfully Downloaded: {success_count}\n"
+    summary += f"• Failed: {failed}\n\n"
+    
     if success_count > 0:
-        summary = f"✅ **Batch Download Complete**\n\n"
-        summary += f"• Total Messages: {len(msg_ids)}\n"
-        summary += f"• Successfully Downloaded: {success_count}\n"
-        summary += f"• Failed: {len(msg_ids) - success_count}\n\n"
+        total_size = sum(r['size'] for r in results)
+        size_str = f"{total_size/1024/1024:.2f} MB" if total_size > 1024*1024 else f"{total_size/1024:.2f} KB"
+        summary += f"• Total Size: {size_str}\n"
         
-        if success_count <= 10:  # Only show details for small batches
+        if success_count <= 5:  # Show details for small batches
+            summary += "\n**Downloaded Files:**\n"
             for result in results:
-                size_str = f"{result['size']/1024:.1f} KB" if result['size'] < 1024*1024 else f"{result['size']/(1024*1024):.1f} MB"
-                summary += f"📄 **{result['type'].title()}**: `{result['original']}` ({size_str})\n"
-        
-        await message.reply(summary)
+                file_size = f"{result['size']/1024/1024:.2f} MB" if result['size'] > 1024*1024 else f"{result['size']/1024:.2f} KB"
+                summary += f"- {result['original']} ({file_size})\n"
+    
+    await message.reply(summary)
     else:
         await message.reply("⚠️ **No files were downloaded successfully.**")
 
