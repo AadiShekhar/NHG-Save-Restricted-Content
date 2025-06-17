@@ -326,7 +326,7 @@ async def process_message_batch(
     failed = 0
     
     async def process_single_message(msg_id: int):
-        nonlocal failed  # Move this to the top of the function
+        nonlocal failed  # This is the fixed line that was causing the error
         async with semaphore:
             if batch_status.is_batch_active(user_id):
                 return None
@@ -334,7 +334,7 @@ async def process_message_batch(
             try:
                 result = await download_file(client, acc, message, chat_id, msg_id, user_id)
                 if result:
-                results.append(result)
+                    results.append(result)
                 else:
                     failed += 1
             except Exception as e:
