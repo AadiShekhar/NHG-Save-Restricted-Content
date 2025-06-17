@@ -18,10 +18,10 @@ import re
 from typing import List, Dict, Optional, Tuple
 
 # Constants
-MAX_PARALLEL_DOWNLOADS = 3  # Reduced for better stability with large files
+MAX_PARALLEL_DOWNLOADS = 5  # Reduced for better stability with large files
 DOWNLOAD_TIMEOUT = 900  # 15 minutes timeout for large files
 STATUS_UPDATE_INTERVAL = 10  # Seconds between status updates
-MAX_BATCH_SIZE = 50  # Maximum messages per batch
+MAX_BATCH_SIZE = 5000 # Maximum messages per batch
 FLOOD_WAIT_THRESHOLD = 5  # Seconds after which we show flood wait warning
 
 class BatchStatus:
