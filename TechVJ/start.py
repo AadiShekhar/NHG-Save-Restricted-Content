@@ -18,11 +18,11 @@ import re
 from typing import List, Dict, Optional, Tuple
 
 # Constants
-MAX_PARALLEL_DOWNLOADS = 5  # Increased for parallel downloads
-DOWNLOAD_TIMEOUT = 1200  # Increased timeout for parallel downloads
+MAX_PARALLEL_DOWNLOADS = 5
+DOWNLOAD_TIMEOUT = 1200
 STATUS_UPDATE_INTERVAL = 10
-MAX_BATCH_SIZE = 50
-FLOOD_WAIT_THRESHOLD = 10  # Increased flood wait threshold
+MAX_BATCH_SIZE = 5000
+FLOOD_WAIT_THRESHOLD = 10
 DOWNLOADS_DIR = "downloads"
 
 # Create downloads directory if it doesn't exist
@@ -36,13 +36,18 @@ class BatchStatus:
         self.status_messages: Dict[int, Message] = {}
         self.progress: Dict[int, Dict[str, Tuple[float, str]]] = {}
         self.last_flood_wait: Dict[int, float] = {}
-        self.active_downloads: Dict[int, int] = {}  # Track active downloads per user
+        self.active_downloads: Dict[int, int] = {}
+        self.completed_batches: Dict[int, bool] = {}
 
     def is_batch_active(self, user_id: int) -> bool:
         return not self.active_batches.get(user_id, True)
     
     def set_batch_status(self, user_id: int, status: bool):
         self.active_batches[user_id] = not status
+        if status:  # If marking as complete
+            self.completed_batches[user_id] = True
+        else:
+            self.completed_batches.pop(user_id, None)
         
     def add_download_task(self, user_id: int, task: asyncio.Task):
         if user_id not in self.download_tasks:
@@ -75,6 +80,9 @@ class BatchStatus:
         
     def get_active_downloads(self, user_id: int) -> int:
         return self.active_downloads.get(user_id, 0)
+    
+    def is_batch_completed(self, user_id: int) -> bool:
+        return self.completed_batches.get(user_id, False)
 
 batch_status = BatchStatus()
 
@@ -117,6 +125,15 @@ async def download_status_updater(client: Client, user_id: int, chat_id: int, st
                 pass
         
         await asyncio.sleep(STATUS_UPDATE_INTERVAL)
+    
+    # Final update when batch completes
+    if user_id in batch_status.status_messages and batch_status.is_batch_completed(user_id):
+        try:
+            await batch_status.status_messages[user_id].edit_text("✅ **Batch download completed successfully!**")
+            await asyncio.sleep(3)
+            await batch_status.status_messages[user_id].delete()
+        except:
+            pass
 
 def clean_filename(text: str) -> str:
     return re.sub(r'[\\/*?:"<>|]', "", text).strip()
@@ -307,9 +324,11 @@ async def process_message_batch(
 ):
     user_id = message.from_user.id
     
-    if not batch_status.is_batch_active(user_id):
+    if not batch_status.is_batch_active(user_id) and not batch_status.is_batch_completed(user_id):
         return await message.reply("Another batch is already in progress. Wait or use /cancel.")
 
+    # Reset completion status when starting new batch
+    batch_status.completed_batches.pop(user_id, None)
     batch_status.set_batch_status(user_id, False)
     batch_status.cancel_all_tasks(user_id)
     
@@ -366,7 +385,7 @@ async def process_message_batch(
         task = asyncio.create_task(process_single_message(msg_id))
         tasks.append(task)
         batch_status.add_download_task(user_id, task)
-        await asyncio.sleep(0.1)  # Small delay between task creation
+        await asyncio.sleep(0.1)
     
     try:
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -389,6 +408,9 @@ async def process_message_batch(
     except:
         pass
     
+    # Mark batch as completed
+    batch_status.set_batch_status(user_id, True)
+    
     if user_id in batch_status.status_messages:
         try:
             await batch_status.status_messages[user_id].delete()
@@ -396,11 +418,7 @@ async def process_message_batch(
             pass
         del batch_status.status_messages[user_id]
     
-    batch_status.set_batch_status(user_id, True)
-    
-    if batch_status.is_batch_active(user_id):
-        return
-    
+    # Send summary
     success_count = len(results)
     total_count = len(msg_ids)
     
@@ -453,7 +471,10 @@ async def send_cancel(client: Client, message: Message):
     batch_status.set_batch_status(user_id, True)
     batch_status.cancel_all_tasks(user_id)
     if user_id in batch_status.status_messages:
-        await batch_status.status_messages[user_id].delete()
+        try:
+            await batch_status.status_messages[user_id].delete()
+        except:
+            pass
         del batch_status.status_messages[user_id]
     await client.send_message(
         chat_id=message.chat.id, 
@@ -466,7 +487,7 @@ async def save(client: Client, message: Message):
         return
 
     user_id = message.from_user.id
-    if not batch_status.is_batch_active(user_id):
+    if not batch_status.is_batch_active(user_id) and not batch_status.is_batch_completed(user_id):
         return await message.reply("**One task is already processing. Wait for it to complete or use /cancel.**")
 
     user_data = await db.get_session(user_id)
