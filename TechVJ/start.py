@@ -23,6 +23,11 @@ DOWNLOAD_TIMEOUT = 900  # 15 minutes timeout for large files
 STATUS_UPDATE_INTERVAL = 10  # Seconds between status updates
 MAX_BATCH_SIZE = 5000 # Maximum messages per batch
 FLOOD_WAIT_THRESHOLD = 5  # Seconds after which we show flood wait warning
+# Add this with your other constants at the top of the file
+DOWNLOADS_DIR = "downloads"  # Or any path you prefer like "/home/user/downloads"
+# Create downloads directory if it doesn't exist
+if not os.path.exists(DOWNLOADS_DIR):
+    os.makedirs(DOWNLOADS_DIR)
 
 class BatchStatus:
     def __init__(self):
