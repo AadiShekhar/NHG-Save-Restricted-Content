@@ -18,13 +18,13 @@ import re
 from typing import List, Dict, Optional, Tuple
 
 # Constants
-MAX_PARALLEL_DOWNLOADS = 5  # Reduced for better stability with large files
-DOWNLOAD_TIMEOUT = 900  # 15 minutes timeout for large files
-STATUS_UPDATE_INTERVAL = 10  # Seconds between status updates
-MAX_BATCH_SIZE = 5000 # Maximum messages per batch
-FLOOD_WAIT_THRESHOLD = 5  # Seconds after which we show flood wait warning
-# Add this with your other constants at the top of the file
-DOWNLOADS_DIR = "downloads"  # Or any path you prefer like "/home/user/downloads"
+MAX_PARALLEL_DOWNLOADS = 5  # Increased for parallel downloads
+DOWNLOAD_TIMEOUT = 1200  # Increased timeout for parallel downloads
+STATUS_UPDATE_INTERVAL = 10
+MAX_BATCH_SIZE = 50
+FLOOD_WAIT_THRESHOLD = 10  # Increased flood wait threshold
+DOWNLOADS_DIR = "downloads"
+
 # Create downloads directory if it doesn't exist
 if not os.path.exists(DOWNLOADS_DIR):
     os.makedirs(DOWNLOADS_DIR)
@@ -34,8 +34,9 @@ class BatchStatus:
         self.active_batches: Dict[int, bool] = {}
         self.download_tasks: Dict[int, List[asyncio.Task]] = {}
         self.status_messages: Dict[int, Message] = {}
-        self.progress: Dict[int, Dict[str, Tuple[float, str]]] = {}  # (progress, status)
+        self.progress: Dict[int, Dict[str, Tuple[float, str]]] = {}
         self.last_flood_wait: Dict[int, float] = {}
+        self.active_downloads: Dict[int, int] = {}  # Track active downloads per user
 
     def is_batch_active(self, user_id: int) -> bool:
         return not self.active_batches.get(user_id, True)
@@ -65,6 +66,15 @@ class BatchStatus:
     
     def record_flood_wait(self, user_id: int, wait_time: float):
         self.last_flood_wait[user_id] = wait_time
+        
+    def increment_active_downloads(self, user_id: int):
+        self.active_downloads[user_id] = self.active_downloads.get(user_id, 0) + 1
+        
+    def decrement_active_downloads(self, user_id: int):
+        self.active_downloads[user_id] = max(0, self.active_downloads.get(user_id, 0) - 1)
+        
+    def get_active_downloads(self, user_id: int) -> int:
+        return self.active_downloads.get(user_id, 0)
 
 batch_status = BatchStatus()
 
@@ -76,7 +86,6 @@ async def download_status_updater(client: Client, user_id: int, chat_id: int, st
         current_time = time.time()
         progress = batch_status.get_progress(user_id)
         
-        # Check for recent flood wait
         last_flood = batch_status.last_flood_wait.get(user_id, 0)
         if last_flood >= FLOOD_WAIT_THRESHOLD and not flood_wait_warning_sent:
             await client.send_message(
@@ -97,7 +106,10 @@ async def download_status_updater(client: Client, user_id: int, chat_id: int, st
                     completed += 1
                 status_text += f"• {msg_id}: {status} ({percent:.1f}%)\n"
             
-            status_text += f"\n**Completed:** {completed}/{total}"
+            status_text += (
+                f"\n**Completed:** {completed}/{total}\n"
+                f"**Active Downloads:** {batch_status.get_active_downloads(user_id)}/{MAX_PARALLEL_DOWNLOADS}"
+            )
             
             try:
                 await batch_status.status_messages[user_id].edit_text(status_text)
@@ -205,19 +217,18 @@ async def download_file(
         file_info = get_file_info(msg, msg_id)
         file_path = os.path.join(DOWNLOADS_DIR, file_info["name"])
         
-        # Ensure unique filename
         counter = 1
         base_name, ext = os.path.splitext(file_info["name"])
         while os.path.exists(file_path):
             file_path = os.path.join(DOWNLOADS_DIR, f"{base_name}_{counter}{ext}")
             counter += 1
 
-        # Download with progress
         def progress(current, total):
             percent = current * 100 / total
             batch_status.update_progress(user_id, msg_id, percent, "Downloading")
 
         batch_status.update_progress(user_id, msg_id, 0, "Starting download")
+        batch_status.increment_active_downloads(user_id)
         
         try:
             dl_path = await asyncio.wait_for(
@@ -251,6 +262,8 @@ async def download_file(
                     reply_to_message_id=message.id
                 )
             return None
+        finally:
+            batch_status.decrement_active_downloads(user_id)
 
         if not dl_path or not os.path.exists(dl_path):
             batch_status.update_progress(user_id, msg_id, 0, "Download failed")
@@ -259,7 +272,6 @@ async def download_file(
         file_size = os.path.getsize(dl_path)
         batch_status.update_progress(user_id, msg_id, 100, "Completed")
         
-        # Save caption if exists
         caption_path = None
         if msg.caption:
             caption_filename = f"{os.path.splitext(file_info['name'])[0]}_caption.txt"
@@ -295,12 +307,11 @@ async def process_message_batch(
 ):
     user_id = message.from_user.id
     
-    # Check if already in a batch
     if not batch_status.is_batch_active(user_id):
         return await message.reply("Another batch is already in progress. Wait or use /cancel.")
 
     batch_status.set_batch_status(user_id, False)
-    batch_status.cancel_all_tasks(user_id)  # Clear any previous tasks
+    batch_status.cancel_all_tasks(user_id)
     
     try:
         acc = Client("saverestricted", session_string=user_data, api_hash=API_HASH, api_id=API_ID)
@@ -309,29 +320,27 @@ async def process_message_batch(
         batch_status.set_batch_status(user_id, True)
         return await message.reply(f"**Session Error:** `{e}`\n\n/logout and /login again.")
 
-    # Create status message
     status_msg = await client.send_message(
         message.chat.id,
-        "🔄 **Starting batch download...**\n\n"
+        "🔄 **Starting parallel downloads...**\n\n"
         f"• Total Messages: {len(msg_ids)}\n"
+        f"• Parallel Downloads: {MAX_PARALLEL_DOWNLOADS}\n"
         "• Preparing to download...",
         reply_to_message_id=message.id
     )
     batch_status.status_messages[user_id] = status_msg
     
-    # Start status updater
     status_task = asyncio.create_task(
         download_status_updater(client, user_id, message.chat.id, message)
     )
     
-    # Process downloads with limited concurrency
-    semaphore = asyncio.Semaphore(MAX_PARALLEL_DOWNLOADS)
+    semaphore = asyncio.BoundedSemaphore(MAX_PARALLEL_DOWNLOADS)
     tasks = []
     results = []
     failed = 0
     
     async def process_single_message(msg_id: int):
-        nonlocal failed  # This is the fixed line that was causing the error
+        nonlocal failed, results
         async with semaphore:
             if batch_status.is_batch_active(user_id):
                 return None
@@ -351,15 +360,14 @@ async def process_message_batch(
                         reply_to_message_id=message.id
                     )
 
-    # Create tasks for all messages
     for msg_id in msg_ids:
         if batch_status.is_batch_active(user_id):
             break
         task = asyncio.create_task(process_single_message(msg_id))
-        batch_status.add_download_task(user_id, task)
         tasks.append(task)
+        batch_status.add_download_task(user_id, task)
+        await asyncio.sleep(0.1)  # Small delay between task creation
     
-    # Wait for all tasks to complete
     try:
         await asyncio.gather(*tasks, return_exceptions=True)
     except Exception as e:
@@ -370,13 +378,11 @@ async def process_message_batch(
                 reply_to_message_id=message.id
             )
     
-    # Clean up
     try:
         await acc.stop()
     except:
         pass
     
-    # Cancel status updater
     status_task.cancel()
     try:
         await status_task
@@ -390,14 +396,11 @@ async def process_message_batch(
             pass
         del batch_status.status_messages[user_id]
     
-    # Set batch as complete
     batch_status.set_batch_status(user_id, True)
     
-    # Don't show summary if batch was cancelled
     if batch_status.is_batch_active(user_id):
         return
     
-    # Send summary
     success_count = len(results)
     total_count = len(msg_ids)
     
@@ -411,7 +414,7 @@ async def process_message_batch(
         size_str = f"{total_size/1024/1024:.2f} MB" if total_size > 1024*1024 else f"{total_size/1024:.2f} KB"
         summary += f"• Total Size: {size_str}\n"
         
-        if success_count <= 5:  # Show details for small batches
+        if success_count <= 5:
             summary += "\n**Downloaded Files:**\n"
             for result in results:
                 file_size = f"{result['size']/1024/1024:.2f} MB" if result['size'] > 1024*1024 else f"{result['size']/1024:.2f} KB"
@@ -482,12 +485,11 @@ async def save(client: Client, message: Message):
     if len(msg_ids) > MAX_BATCH_SIZE:
         return await message.reply(f"**Batch size too large. Maximum {MAX_BATCH_SIZE} messages per batch.**")
 
-    # Determine chat ID based on URL type
-    if "https://t.me/c/" in message.text:  # Private
+    if "https://t.me/c/" in message.text:
         chat_id = int("-100" + datas[4])
-    elif "https://t.me/b/" in message.text:  # Bot
-        chat_id = datas[4]  # username
-    else:  # Public
-        chat_id = datas[3]  # username
+    elif "https://t.me/b/" in message.text:
+        chat_id = datas[4]
+    else:
+        chat_id = datas[3]
 
     await process_message_batch(client, message, chat_id, msg_ids, user_data)
