@@ -326,25 +326,25 @@ async def process_message_batch(
     failed = 0
     
     async def process_single_message(msg_id: int):
-    nonlocal failed  # Move this to the top of the function
-    async with semaphore:
-        if batch_status.is_batch_active(user_id):
-            return None
-            
-        try:
-            result = await download_file(client, acc, message, chat_id, msg_id, user_id)
-            if result:
+        nonlocal failed  # Move this to the top of the function
+        async with semaphore:
+            if batch_status.is_batch_active(user_id):
+                return None
+                
+            try:
+                result = await download_file(client, acc, message, chat_id, msg_id, user_id)
+                if result:
                 results.append(result)
-            else:
+                else:
+                    failed += 1
+            except Exception as e:
                 failed += 1
-        except Exception as e:
-            failed += 1
-            if ERROR_MESSAGE:
-                await client.send_message(
-                    message.chat.id,
-                    f"⚠️ **Error Processing Message**\n\nID: {msg_id}\nError: `{e}`",
-                    reply_to_message_id=message.id
-                )
+                if ERROR_MESSAGE:
+                    await client.send_message(
+                        message.chat.id,
+                        f"⚠️ **Error Processing Message**\n\nID: {msg_id}\nError: `{e}`",
+                        reply_to_message_id=message.id
+                    )
 
     # Create tasks for all messages
     for msg_id in msg_ids:
