@@ -18,7 +18,7 @@ import re
 from typing import List, Dict, Optional, Tuple
 
 # Constants
-MAX_PARALLEL_DOWNLOADS = 100
+MAX_PARALLEL_DOWNLOADS = 20
 DOWNLOAD_TIMEOUT = 1200
 STATUS_UPDATE_INTERVAL = 10
 MAX_BATCH_SIZE = 5000
@@ -39,7 +39,7 @@ class BatchStatus:
         self.active_batches: Dict[int, bool] = {}
         self.download_tasks: Dict[int, List[asyncio.Task]] = {}
         self.status_messages: Dict[int, Message] = {}
-        self.progress: Dict[int, Dict[str, Tuple[float, str]] = {}
+        self.progress: Dict[int, Dict[str, Tuple[float, str]]] = {}
         self.last_flood_wait: Dict[int, float] = {}
         self.active_downloads: Dict[int, int] = {}
         self.completed_batches: Dict[int, bool] = {}
