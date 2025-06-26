@@ -18,12 +18,17 @@ import re
 from typing import List, Dict, Optional, Tuple
 
 # Constants
-MAX_PARALLEL_DOWNLOADS = 50
-DOWNLOAD_TIMEOUT = 200
+MAX_PARALLEL_DOWNLOADS = 5
+DOWNLOAD_TIMEOUT = 1200
 STATUS_UPDATE_INTERVAL = 10
 MAX_BATCH_SIZE = 5000
 FLOOD_WAIT_THRESHOLD = 10
 DOWNLOADS_DIR = "downloads"
+INITIAL_DELAY = 0.5  # Start with 500ms delay between requests
+MAX_DELAY = 5.0      # Maximum delay between requests when throttled
+DELAY_INCREMENT = 0.2 # How much to increase delay after flood wait
+DELAY_DECREMENT = 0.1 # How much to decrease delay when no flood waits
+CHUNK_SIZE = 100     # Process messages in chunks of this size
 
 # Create downloads directory if it doesn't exist
 if not os.path.exists(DOWNLOADS_DIR):
@@ -34,10 +39,13 @@ class BatchStatus:
         self.active_batches: Dict[int, bool] = {}
         self.download_tasks: Dict[int, List[asyncio.Task]] = {}
         self.status_messages: Dict[int, Message] = {}
-        self.progress: Dict[int, Dict[str, Tuple[float, str]]] = {}
+        self.progress: Dict[int, Dict[str, Tuple[float, str]] = {}
         self.last_flood_wait: Dict[int, float] = {}
         self.active_downloads: Dict[int, int] = {}
         self.completed_batches: Dict[int, bool] = {}
+        self.current_delays: Dict[int, float] = {}
+        self.failed_messages: Dict[int, List[int]] = {}
+        self.retry_counts: Dict[int, Dict[int, int]] = {}
 
     def is_batch_active(self, user_id: int) -> bool:
         return not self.active_batches.get(user_id, True)
@@ -83,6 +91,32 @@ class BatchStatus:
     
     def is_batch_completed(self, user_id: int) -> bool:
         return self.completed_batches.get(user_id, False)
+    
+    def get_current_delay(self, user_id: int) -> float:
+        return self.current_delays.get(user_id, INITIAL_DELAY)
+        
+    def adjust_delay(self, user_id: int, had_flood_wait: bool):
+        current = self.get_current_delay(user_id)
+        if had_flood_wait:
+            new_delay = min(current + DELAY_INCREMENT, MAX_DELAY)
+        else:
+            new_delay = max(current - DELAY_DECREMENT, INITIAL_DELAY)
+        self.current_delays[user_id] = new_delay
+        return new_delay
+    
+    def add_failed_message(self, user_id: int, msg_id: int):
+        if user_id not in self.failed_messages:
+            self.failed_messages[user_id] = []
+        self.failed_messages[user_id].append(msg_id)
+    
+    def get_failed_messages(self, user_id: int) -> List[int]:
+        return self.failed_messages.get(user_id, [])
+    
+    def increment_retry_count(self, user_id: int, msg_id: int):
+        if user_id not in self.retry_counts:
+            self.retry_counts[user_id] = {}
+        self.retry_counts[user_id][msg_id] = self.retry_counts[user_id].get(msg_id, 0) + 1
+        return self.retry_counts[user_id][msg_id]
 
 batch_status = BatchStatus()
 
@@ -99,6 +133,7 @@ async def download_status_updater(client: Client, user_id: int, chat_id: int, st
             await client.send_message(
                 chat_id,
                 f"⚠️ **Slowing down downloads due to Telegram rate limits**\n\n"
+                f"Current delay between requests: {batch_status.get_current_delay(user_id):.1f}s\n"
                 f"The bot is automatically adjusting download speed to avoid restrictions.",
                 reply_to_message_id=start_msg.id
             )
@@ -116,8 +151,14 @@ async def download_status_updater(client: Client, user_id: int, chat_id: int, st
             
             status_text += (
                 f"\n**Completed:** {completed}/{total}\n"
-                f"**Active Downloads:** {batch_status.get_active_downloads(user_id)}/{MAX_PARALLEL_DOWNLOADS}"
+                f"**Active Downloads:** {batch_status.get_active_downloads(user_id)}/{MAX_PARALLEL_DOWNLOADS}\n"
+                f"**Current Delay:** {batch_status.get_current_delay(user_id):.1f}s"
             )
+            
+            # Add failed messages count if any
+            failed_count = len(batch_status.get_failed_messages(user_id))
+            if failed_count > 0:
+                status_text += f"\n**Failed:** {failed_count} (will retry)"
             
             try:
                 await batch_status.status_messages[user_id].edit_text(status_text)
@@ -257,12 +298,19 @@ async def download_file(
                 timeout=DOWNLOAD_TIMEOUT
             )
         except FloodWait as e:
-            batch_status.record_flood_wait(user_id, e.value)
-            batch_status.update_progress(user_id, msg_id, 0, f"Waiting {e.value}s")
-            await asyncio.sleep(e.value)
-            return await download_file(client, acc, message, chat_id, msg_id, user_id)
+            wait_time = min(e.value, 60)  # Never wait more than 60 seconds
+            batch_status.record_flood_wait(user_id, wait_time)
+            batch_status.update_progress(user_id, msg_id, 0, f"Waiting {wait_time}s")
+            batch_status.add_failed_message(user_id, msg_id)
+            await asyncio.sleep(wait_time)
+            # Retry with increased delay
+            retry_count = batch_status.increment_retry_count(user_id, msg_id)
+            if retry_count <= 3:  # Max 3 retries
+                return await download_file(client, acc, message, chat_id, msg_id, user_id)
+            return None
         except asyncio.TimeoutError:
             batch_status.update_progress(user_id, msg_id, 0, "Timeout")
+            batch_status.add_failed_message(user_id, msg_id)
             if ERROR_MESSAGE:
                 await client.send_message(
                     message.chat.id,
@@ -272,6 +320,7 @@ async def download_file(
             return None
         except Exception as e:
             batch_status.update_progress(user_id, msg_id, 0, f"Error: {str(e)}")
+            batch_status.add_failed_message(user_id, msg_id)
             if ERROR_MESSAGE:
                 await client.send_message(
                     message.chat.id,
@@ -284,6 +333,7 @@ async def download_file(
 
         if not dl_path or not os.path.exists(dl_path):
             batch_status.update_progress(user_id, msg_id, 0, "Download failed")
+            batch_status.add_failed_message(user_id, msg_id)
             raise Exception("Download failed - file not created")
 
         file_size = os.path.getsize(dl_path)
@@ -307,6 +357,7 @@ async def download_file(
 
     except Exception as e:
         batch_status.update_progress(user_id, msg_id, 0, f"Error: {str(e)}")
+        batch_status.add_failed_message(user_id, msg_id)
         if ERROR_MESSAGE:
             await client.send_message(
                 message.chat.id,
@@ -331,6 +382,7 @@ async def process_message_batch(
     batch_status.completed_batches.pop(user_id, None)
     batch_status.set_batch_status(user_id, False)
     batch_status.cancel_all_tasks(user_id)
+    batch_status.current_delays[user_id] = INITIAL_DELAY  # Reset delay
     
     try:
         acc = Client("saverestricted", session_string=user_data, api_hash=API_HASH, api_id=API_ID)
@@ -344,6 +396,7 @@ async def process_message_batch(
         "🔄 **Starting parallel downloads...**\n\n"
         f"• Total Messages: {len(msg_ids)}\n"
         f"• Parallel Downloads: {MAX_PARALLEL_DOWNLOADS}\n"
+        f"• Initial Delay: {INITIAL_DELAY}s\n"
         "• Preparing to download...",
         reply_to_message_id=message.id
     )
@@ -364,12 +417,33 @@ async def process_message_batch(
             if batch_status.is_batch_active(user_id):
                 return None
                 
+            # Apply current delay
+            current_delay = batch_status.get_current_delay(user_id)
+            await asyncio.sleep(current_delay)
+            
             try:
                 result = await download_file(client, acc, message, chat_id, msg_id, user_id)
                 if result:
                     results.append(result)
+                    # If successful, slightly reduce delay
+                    batch_status.adjust_delay(user_id, had_flood_wait=False)
                 else:
                     failed += 1
+            except FloodWait as e:
+                failed += 1
+                wait_time = min(e.value, 60)
+                # Increase delay significantly when flood wait occurs
+                new_delay = batch_status.adjust_delay(user_id, had_flood_wait=True)
+                if ERROR_MESSAGE:
+                    await client.send_message(
+                        message.chat.id,
+                        f"⚠️ **Slowing Down**\n\n"
+                        f"Message ID: {msg_id}\n"
+                        f"Flood Wait: {wait_time}s\n"
+                        f"New Delay: {new_delay:.1f}s",
+                        reply_to_message_id=message.id
+                    )
+                await asyncio.sleep(wait_time)
             except Exception as e:
                 failed += 1
                 if ERROR_MESSAGE:
@@ -379,23 +453,21 @@ async def process_message_batch(
                         reply_to_message_id=message.id
                     )
 
-    for msg_id in msg_ids:
-        if batch_status.is_batch_active(user_id):
-            break
-        task = asyncio.create_task(process_single_message(msg_id))
-        tasks.append(task)
-        batch_status.add_download_task(user_id, task)
-        await asyncio.sleep(0.1)
-    
-    try:
+    # Process messages in chunks
+    batch_size = len(msg_ids)
+    for i in range(0, batch_size, CHUNK_SIZE):
+        chunk = msg_ids[i:i + CHUNK_SIZE]
+        for msg_id in chunk:
+            if batch_status.is_batch_active(user_id):
+                break
+            task = asyncio.create_task(process_single_message(msg_id))
+            tasks.append(task)
+            batch_status.add_download_task(user_id, task)
+            await asyncio.sleep(batch_status.get_current_delay(user_id))
+        
+        # Wait for current chunk to complete before proceeding
         await asyncio.gather(*tasks, return_exceptions=True)
-    except Exception as e:
-        if ERROR_MESSAGE:
-            await client.send_message(
-                message.chat.id,
-                f"⚠️ **Batch Error:** `{e}`",
-                reply_to_message_id=message.id
-            )
+        tasks = []
     
     try:
         await acc.stop()
@@ -421,11 +493,14 @@ async def process_message_batch(
     # Send summary
     success_count = len(results)
     total_count = len(msg_ids)
+    failed_messages = batch_status.get_failed_messages(user_id)
+    final_failed = len(failed_messages)
     
     summary = f"✅ **Batch Download Complete**\n\n"
     summary += f"• Total Messages: {total_count}\n"
     summary += f"• Successfully Downloaded: {success_count}\n"
-    summary += f"• Failed: {failed}\n\n"
+    summary += f"• Failed: {final_failed}\n"
+    summary += f"• Final Delay: {batch_status.get_current_delay(user_id):.1f}s\n\n"
     
     if success_count > 0:
         total_size = sum(r['size'] for r in results)
@@ -437,6 +512,12 @@ async def process_message_batch(
             for result in results:
                 file_size = f"{result['size']/1024/1024:.2f} MB" if result['size'] > 1024*1024 else f"{result['size']/1024:.2f} KB"
                 summary += f"- {result['original']} ({file_size})\n"
+    
+    if final_failed > 0:
+        summary += f"\n**Failed Messages:** {final_failed}\n"
+        if final_failed <= 10:
+            summary += f"IDs: {', '.join(map(str, failed_messages))}\n"
+        summary += "These messages will be automatically retried in the next batch."
     
     await message.reply(summary)
 
