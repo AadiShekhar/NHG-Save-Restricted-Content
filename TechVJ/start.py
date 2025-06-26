@@ -18,7 +18,7 @@ import re
 from typing import List, Dict, Optional, Tuple
 
 # Constants
-MAX_PARALLEL_DOWNLOADS = 5
+MAX_PARALLEL_DOWNLOADS = 100
 DOWNLOAD_TIMEOUT = 1200
 STATUS_UPDATE_INTERVAL = 10
 MAX_BATCH_SIZE = 5000
