@@ -17,13 +17,15 @@ from datetime import datetime
 import re
 from typing import List, Dict, Optional, Tuple
 
-# Constants
-MAX_PARALLEL_DOWNLOADS = 20
-DOWNLOAD_TIMEOUT = 100
-STATUS_UPDATE_INTERVAL = 10
+# Constants - Optimized for faster downloads
+MAX_PARALLEL_DOWNLOADS = 30  # Increased from 20 to 30
+DOWNLOAD_TIMEOUT = 60        # Reduced from 100 to 60 seconds
+STATUS_UPDATE_INTERVAL = 8   # Reduced from 10 to 8 seconds
 MAX_BATCH_SIZE = 5000
 FLOOD_WAIT_THRESHOLD = 10
 DOWNLOADS_DIR = "downloads"
+RETRY_ATTEMPTS = 2           # Add retry mechanism
+CONNECTION_TIMEOUT = 30      # Connection timeout for downloads
 
 # Create downloads directory if it doesn't exist
 if not os.path.exists(DOWNLOADS_DIR):
@@ -35,6 +37,456 @@ class BatchStatus:
         self.download_tasks: Dict[int, List[asyncio.Task]] = {}
         self.status_messages: Dict[int, Message] = {}
         self.progress: Dict[int, Dict[str, Tuple[float, str]]] = {}
+        self.last_flood_wait: Dict[int, float] = {}
+        self.active_downloads: Dict[int, int] = {}
+        self.completed_batches: Dict[int, bool] = {}
+        self.retry_count: Dict[int, Dict[int, int]] = {}  # Track retries per message
+
+    def is_batch_active(self, user_id: int) -> bool:
+        return not self.active_batches.get(user_id, True)
+    
+    def set_batch_status(self, user_id: int, status: bool):
+        self.active_batches[user_id] = not status
+        if status:  # If marking as complete
+            self.completed_batches[user_id] = True
+        else:
+            self.completed_batches.pop(user_id, None)
+            # Reset retry count when starting new batch
+            self.retry_count[user_id] = {}
+        
+    def add_download_task(self, user_id: int, task: asyncio.Task):
+        if user_id not in self.download_tasks:
+            self.download_tasks[user_id] = []
+        self.download_tasks[user_id].append(task)
+        
+    def cancel_all_tasks(self, user_id: int):
+        if user_id in self.download_tasks:
+            for task in self.download_tasks[user_id]:
+                if not task.done():
+                    task.cancel()
+            self.download_tasks[user_id] = []
+            
+    def update_progress(self, user_id: int, msg_id: int, progress: float, status: str = "Downloading"):
+        if user_id not in self.progress:
+            self.progress[user_id] = {}
+        self.progress[user_id][msg_id] = (progress, status)
+        
+    def get_progress(self, user_id: int) -> Dict[int, Tuple[float, str]]:
+        return self.progress.get(user_id, {})
+    
+    def record_flood_wait(self, user_id: int, wait_time: float):
+        self.last_flood_wait[user_id] = wait_time
+        
+    def increment_active_downloads(self, user_id: int):
+        self.active_downloads[user_id] = self.active_downloads.get(user_id, 0) + 1
+        
+    def decrement_active_downloads(self, user_id: int):
+        self.active_downloads[user_id] = max(0, self.active_downloads.get(user_id, 0) - 1)
+        
+    def get_active_downloads(self, user_id: int) -> int:
+        return self.active_downloads.get(user_id, 0)
+    
+    def is_batch_completed(self, user_id: int) -> bool:
+        return self.completed_batches.get(user_id, False)
+    
+    def increment_retry_count(self, user_id: int, msg_id: int) -> int:
+        if user_id not in self.retry_count:
+            self.retry_count[user_id] = {}
+        if msg_id not in self.retry_count[user_id]:
+            self.retry_count[user_id][msg_id] = 0
+        self.retry_count[user_id][msg_id] += 1
+        return self.retry_count[user_id][msg_id]
+    
+    def get_retry_count(self, user_id: int, msg_id: int) -> int:
+        if user_id in self.retry_count and msg_id in self.retry_count[user_id]:
+            return self.retry_count[user_id][msg_id]
+        return 0
+
+batch_status = BatchStatus()
+
+async def download_status_updater(client: Client, user_id: int, chat_id: int, start_msg: Message):
+    last_update = 0
+    flood_wait_warning_sent = False
+    
+    while not batch_status.is_batch_active(user_id) and user_id in batch_status.status_messages:
+        current_time = time.time()
+        progress = batch_status.get_progress(user_id)
+        
+        last_flood = batch_status.last_flood_wait.get(user_id, 0)
+        if last_flood >= FLOOD_WAIT_THRESHOLD and not flood_wait_warning_sent:
+            await client.send_message(
+                chat_id,
+                f"⚠️ **Slowing down downloads due to Telegram rate limits**\n\n"
+                f"The bot is automatically adjusting download speed to avoid restrictions.",
+                reply_to_message_id=start_msg.id
+            )
+            flood_wait_warning_sent = True
+        
+        if progress:
+            status_text = "**Download Progress**\n\n"
+            completed = 0
+            total = len(progress)
+            
+            for msg_id, (percent, status) in progress.items():
+                if percent >= 100:
+                    completed += 1
+                status_text += f"• {msg_id}: {status} ({percent:.1f}%)\n"
+            
+            status_text += (
+                f"\n**Completed:** {completed}/{total}\n"
+                f"**Active Downloads:** {batch_status.get_active_downloads(user_id)}/{MAX_PARALLEL_DOWNLOADS}"
+            )
+            
+            try:
+                await batch_status.status_messages[user_id].edit_text(status_text)
+            except:
+                pass
+        
+        await asyncio.sleep(STATUS_UPDATE_INTERVAL)
+    
+    # Final update when batch completes
+    if user_id in batch_status.status_messages and batch_status.is_batch_completed(user_id):
+        try:
+            await batch_status.status_messages[user_id].edit_text("✅ **Batch download completed successfully!**")
+            await asyncio.sleep(3)
+            await batch_status.status_messages[user_id].delete()
+        except:
+            pass
+
+def clean_filename(text: str) -> str:
+    return re.sub(r'[\\/*?:"<>|]', "", text).strip()
+
+def get_file_info(msg: pyrogram.types.Message, msgid: int) -> Dict[str, str]:
+    file_info = {"ext": "", "name": "", "original": ""}
+    
+    if msg.document:
+        file_info["ext"] = os.path.splitext(msg.document.file_name or "")[1] or ".bin"
+        file_info["original"] = msg.document.file_name or f"document_{msgid}{file_info['ext']}"
+        file_info["name"] = clean_filename(f"{msgid}_{file_info['original']}")
+    elif msg.video:
+        file_info["ext"] = ".mp4"
+        file_info["original"] = msg.video.file_name or f"video_{msgid}.mp4"
+        file_info["name"] = clean_filename(f"{msgid}_{file_info['original']}")
+    elif msg.audio:
+        file_info["ext"] = ".mp3"
+        if msg.audio.title and msg.audio.performer:
+            title = clean_filename(msg.audio.title)
+            artist = clean_filename(msg.audio.performer)
+            file_info["original"] = f"{artist} - {title}.mp3"
+        else:
+            file_info["original"] = msg.audio.file_name or f"audio_{msgid}.mp3"
+        file_info["name"] = clean_filename(f"{msgid}_{file_info['original']}")
+    elif msg.voice:
+        file_info["ext"] = ".ogg"
+        file_info["original"] = f"voice_message_{msgid}.ogg"
+        file_info["name"] = f"{msgid}_voice.ogg"
+    elif msg.photo:
+        file_info["ext"] = ".jpg"
+        file_info["original"] = f"photo_{msgid}.jpg"
+        file_info["name"] = f"{msgid}_photo.jpg"
+    elif msg.sticker:
+        file_info["ext"] = ".webp" if not msg.sticker.is_animated else ".tgs"
+        file_info["original"] = f"sticker_{msgid}{file_info['ext']}"
+        file_info["name"] = f"{msgid}_sticker{file_info['ext']}"
+    elif msg.animation:
+        file_info["ext"] = ".gif"
+        file_info["original"] = msg.animation.file_name or f"animation_{msgid}.gif"
+        file_info["name"] = clean_filename(f"{msgid}_{file_info['original']}")
+    elif msg.video_note:
+        file_info["ext"] = ".mp4"
+        file_info["original"] = f"video_note_{msgid}.mp4"
+        file_info["name"] = f"{msgid}_video_note.mp4"
+    
+    if not file_info["ext"]:
+        file_info["ext"] = ".bin"
+        file_info["original"] = f"file_{msgid}.bin"
+        file_info["name"] = f"{msgid}_file.bin"
+    
+    return file_info
+
+def get_message_type(msg: pyrogram.types.Message) -> str:
+    if msg.document: return "Document"
+    if msg.video: return "Video"
+    if msg.animation: return "Animation"
+    if msg.sticker: return "Sticker"
+    if msg.voice: return "Voice"
+    if msg.audio: return "Audio"
+    if msg.photo: return "Photo"
+    if msg.video_note: return "Video Note"
+    if msg.text: return "Text"
+    return "Unknown"
+
+async def download_file(
+    client: Client,
+    acc: Client,
+    message: Message,
+    chat_id: int,
+    msg_id: int,
+    user_id: int
+) -> Optional[Dict[str, str]]:
+    try:
+        # Check if we should retry this message
+        retry_count = batch_status.get_retry_count(user_id, msg_id)
+        if retry_count >= RETRY_ATTEMPTS:
+            batch_status.update_progress(user_id, msg_id, 0, "Max retries exceeded")
+            return None
+
+        msg = await acc.get_messages(chat_id, msg_id)
+        if msg.empty:
+            batch_status.update_progress(user_id, msg_id, 0, "Message not found")
+            return None
+
+        msg_type = get_message_type(msg)
+        if not msg_type or msg_type == "Unknown":
+            batch_status.update_progress(user_id, msg_id, 0, "Unsupported type")
+            return None
+
+        if msg_type == "Text":
+            text_filename = f"text_message_{msg_id}.txt"
+            text_filepath = os.path.join(DOWNLOADS_DIR, text_filename)
+            with open(text_filepath, 'w', encoding='utf-8') as f:
+                f.write(msg.text or msg.caption or "")
+            batch_status.update_progress(user_id, msg_id, 100, "Completed")
+            return {
+                "type": "text",
+                "path": text_filepath,
+                "original": text_filename,
+                "size": os.path.getsize(text_filepath),
+                "caption": ""
+            }
+
+        file_info = get_file_info(msg, msg_id)
+        file_path = os.path.join(DOWNLOADS_DIR, file_info["name"])
+        
+        counter = 1
+        base_name, ext = os.path.splitext(file_info["name"])
+        while os.path.exists(file_path):
+            file_path = os.path.join(DOWNLOADS_DIR, f"{base_name}_{counter}{ext}")
+            counter += 1
+
+        def progress(current, total):
+            percent = current * 100 / total
+            batch_status.update_progress(user_id, msg_id, percent, "Downloading")
+
+        batch_status.update_progress(user_id, msg_id, 0, "Starting download")
+        batch_status.increment_active_downloads(user_id)
+        
+        try:
+            # Use faster download with connection timeout
+            dl_path = await asyncio.wait_for(
+                acc.download_media(
+                    msg,
+                    file_name=file_path,
+                    progress=progress
+                ),
+                timeout=DOWNLOAD_TIMEOUT
+            )
+        except FloodWait as e:
+            batch_status.record_flood_wait(user_id, e.value)
+            batch_status.update_progress(user_id, msg_id, 0, f"Waiting {e.value}s")
+            await asyncio.sleep(e.value)
+            # Retry after flood wait
+            batch_status.increment_retry_count(user_id, msg_id)
+            return await download_file(client, acc, message, chat_id, msg_id, user_id)
+        except asyncio.TimeoutError:
+            batch_status.update_progress(user_id, msg_id, 0, "Timeout")
+            # Retry on timeout
+            retry_count = batch_status.increment_retry_count(user_id, msg_id)
+            if retry_count < RETRY_ATTEMPTS:
+                batch_status.update_progress(user_id, msg_id, 0, f"Retrying ({retry_count}/{RETRY_ATTEMPTS})")
+                await asyncio.sleep(2)  # Short delay before retry
+                return await download_file(client, acc, message, chat_id, msg_id, user_id)
+            else:
+                if ERROR_MESSAGE:
+                    await client.send_message(
+                        message.chat.id,
+                        f"⚠️ **Download Timeout**\n\nMessage ID: {msg_id} after {RETRY_ATTEMPTS} retries",
+                        reply_to_message_id=message.id
+                    )
+                return None
+        except Exception as e:
+            batch_status.update_progress(user_id, msg_id, 0, f"Error: {str(e)}")
+            # Retry on other errors
+            retry_count = batch_status.increment_retry_count(user_id, msg_id)
+            if retry_count < RETRY_ATTEMPTS:
+                batch_status.update_progress(user_id, msg_id, 0, f"Retrying ({retry_count}/{RETRY_ATTEMPTS})")
+                await asyncio.sleep(2)
+                return await download_file(client, acc, message, chat_id, msg_id, user_id)
+            else:
+                if ERROR_MESSAGE:
+                    await client.send_message(
+                        message.chat.id,
+                        f"⚠️ **Download Failed**\n\nMessage ID: {msg_id}\nError: `{e}` after {RETRY_ATTEMPTS} retries",
+                        reply_to_message_id=message.id
+                    )
+                return None
+        finally:
+            batch_status.decrement_active_downloads(user_id)
+
+        if not dl_path or not os.path.exists(dl_path):
+            batch_status.update_progress(user_id, msg_id, 0, "Download failed")
+            # Retry on download failure
+            retry_count = batch_status.increment_retry_count(user_id, msg_id)
+            if retry_count < RETRY_ATTEMPTS:
+                batch_status.update_progress(user_id, msg_id, 0, f"Retrying ({retry_count}/{RETRY_ATTEMPTS})")
+                await asyncio.sleep(2)
+                return await download_file(client, acc, message, chat_id, msg_id, user_id)
+            else:
+                raise Exception("Download failed - file not created")
+
+        file_size = os.path.getsize(dl_path)
+        batch_status.update_progress(user_id, msg_id, 100, "Completed")
+        
+        caption_path = None
+        if msg.caption:
+            caption_filename = f"{os.path.splitext(file_info['name'])[0]}_caption.txt"
+            caption_path = os.path.join(DOWNLOADS_DIR, caption_filename)
+            with open(caption_path, 'w', encoding='utf-8') as f:
+                f.write(msg.caption)
+        
+        return {
+            "type": msg_type.lower(),
+            "path": dl_path,
+            "original": file_info["original"],
+            "size": file_size,
+            "caption": msg.caption or "",
+            "caption_path": caption_path
+        }
+
+    except Exception as e:
+        batch_status.update_progress(user_id, msg_id, 0, f"Error: {str(e)}")
+        # Retry on general exceptions
+        retry_count = batch_status.increment_retry_count(user_id, msg_id)
+        if retry_count < RETRY_ATTEMPTS:
+            batch_status.update_progress(user_id, msg_id, 0, f"Retrying ({retry_count}/{RETRY_ATTEMPTS})")
+            await asyncio.sleep(2)
+            return await download_file(client, acc, message, chat_id, msg_id, user_id)
+        else:
+            if ERROR_MESSAGE:
+                await client.send_message(
+                    message.chat.id,
+                    f"⚠️ **Error Processing Message**\n\nID: {msg_id}\nError: `{e}` after {RETRY_ATTEMPTS} retries",
+                    reply_to_message_id=message.id
+                )
+            return None
+
+async def process_message_batch(
+    client: Client,
+    message: Message,
+    chat_id: int,
+    msg_ids: List[int],
+    user_data: str
+):
+    user_id = message.from_user.id
+    
+    if not batch_status.is_batch_active(user_id) and not batch_status.is_batch_completed(user_id):
+        return await message.reply("Another batch is already in progress. Wait or use /cancel.")
+
+    # Reset completion status when starting new batch
+    batch_status.completed_batches.pop(user_id, None)
+    batch_status.set_batch_status(user_id, False)
+    batch_status.cancel_all_tasks(user_id)
+    
+    try:
+        # Create session with optimized settings
+        acc = Client(
+            "saverestricted", 
+            session_string=user_data, 
+            api_hash=API_HASH, 
+            api_id=API_ID,
+            workers=MAX_PARALLEL_DOWNLOADS,  # Increase workers for parallel downloads
+            sleep_threshold=30  # Reduce sleep threshold for faster responses
+        )
+        await acc.start()
+    except Exception as e:
+        batch_status.set_batch_status(user_id, True)
+        return await message.reply(f"**Session Error:** `{e}`\n\n/logout and /login again.")
+
+    status_msg = await client.send_message(
+        message.chat.id,
+        "🔄 **Starting parallel downloads...**\n\n"
+        f"• Total Messages: {len(msg_ids)}\n"
+        f"• Parallel Downloads: {MAX_PARALLEL_DOWNLOADS}\n"
+        f"• Max Retry Attempts: {RETRY_ATTEMPTS}\n"
+        "• Preparing to download...",
+        reply_to_message_id=message.id
+    )
+    batch_status.status_messages[user_id] = status_msg
+    
+    status_task = asyncio.create_task(
+        download_status_updater(client, user_id, message.chat.id, message)
+    )
+    
+    semaphore = asyncio.BoundedSemaphore(MAX_PARALLEL_DOWNLOADS)
+    tasks = []
+    results = []
+    failed = 0
+    
+    async def process_single_message(msg_id: int):
+        nonlocal failed, results
+        async with semaphore:
+            if batch_status.is_batch_active(user_id):
+                return None
+                
+            try:
+                result = await download_file(client, acc, message, chat_id, msg_id, user_id)
+                if result:
+                    results.append(result)
+                else:
+                    failed += 1
+            except Exception as e:
+                failed += 1
+                if ERROR_MESSAGE:
+                    await client.send_message(
+                        message.chat.id,
+                        f"⚠️ **Error Processing Message**\n\nID: {msg_id}\nError: `{e}`",
+                        reply_to_message_id=message.id
+                    )
+
+    # Process messages in chunks to avoid overwhelming the system
+    chunk_size = MAX_PARALLEL_DOWNLOADS * 2
+    for i in range(0, len(msg_ids), chunk_size):
+        chunk = msg_ids[i:i + chunk_size]
+        
+        for msg_id in chunk:
+            if batch_status.is_batch_active(user_id):
+                break
+            task = asyncio.create_task(process_single_message(msg_id))
+            tasks.append(task)
+            batch_status.add_download_task(user_id, task)
+            await asyncio.sleep(0.05)  # Reduced delay between task creation
+        
+        # Wait for current chunk to complete before starting next
+        try:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        except Exception as e:
+            if ERROR_MESSAGE:
+                await client.send_message(
+                    message.chat.id,
+                    f"⚠️ **Batch Error:** `{e}`",
+                    reply_to_message_id=message.id
+                )
+        
+        # Clear completed tasks to free memory
+        tasks = [t for t in tasks if not t.done()]
+    
+    try:
+        await acc.stop()
+    except:
+        pass
+    
+    status_task.cancel()
+    try:
+        await status_task
+    except:
+        pass
+    
+    # Mark batch as completed
+    batch_status.set_batch_status(user_id, True)
+    
+    if user_id in batch_status.status_messages:
+        try:
+            await batch_status.status_messages[user_        self.progress: Dict[int, Dict[str, Tuple[float, str]]] = {}
         self.last_flood_wait: Dict[int, float] = {}
         self.active_downloads: Dict[int, int] = {}
         self.completed_batches: Dict[int, bool] = {}
