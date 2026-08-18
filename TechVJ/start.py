@@ -425,8 +425,7 @@ async def process_message_batch(
                     )
 
     # Process messages in chunks to avoid overwhelming the system
--    chunk_size = MAX_PARALLEL_DOWNLOADS * 2
-+    chunk_size = MAX_PARALLEL_DOWNLOADS
+    chunk_size = MAX_PARALLEL_DOWNLOADS
     for i in range(0, len(msg_ids), chunk_size):
         chunk = msg_ids[i:i + chunk_size]
         
