@@ -18,7 +18,7 @@ import re
 from typing import List, Dict, Optional, Tuple
 
 # Constants - Optimized for faster downloads
-MAX_PARALLEL_DOWNLOADS = 30  # Increased from 20 to 30
+MAX_PARALLEL_DOWNLOADS = 5  # Increased from 20 to 30
 DOWNLOAD_TIMEOUT = 60        # Reduced from 100 to 60 seconds
 STATUS_UPDATE_INTERVAL = 8   # Reduced from 10 to 8 seconds
 MAX_BATCH_SIZE = 5000
@@ -273,13 +273,10 @@ async def download_file(
         
         try:
             # Use faster download with connection timeout
-            dl_path = await asyncio.wait_for(
-                acc.download_media(
-                    msg,
-                    file_name=file_path,
-                    progress=progress
-                ),
-                timeout=DOWNLOAD_TIMEOUT
+            dl_path = await acc.download_media(
+                msg,
+                file_name=file_path,
+                progress=progress
             )
         except FloodWait as e:
             batch_status.record_flood_wait(user_id, e.value)
@@ -288,22 +285,6 @@ async def download_file(
             # Retry after flood wait
             batch_status.increment_retry_count(user_id, msg_id)
             return await download_file(client, acc, message, chat_id, msg_id, user_id)
-        except asyncio.TimeoutError:
-            batch_status.update_progress(user_id, msg_id, 0, "Timeout")
-            # Retry on timeout
-            retry_count = batch_status.increment_retry_count(user_id, msg_id)
-            if retry_count < RETRY_ATTEMPTS:
-                batch_status.update_progress(user_id, msg_id, 0, f"Retrying ({retry_count}/{RETRY_ATTEMPTS})")
-                await asyncio.sleep(2)  # Short delay before retry
-                return await download_file(client, acc, message, chat_id, msg_id, user_id)
-            else:
-                if ERROR_MESSAGE:
-                    await client.send_message(
-                        message.chat.id,
-                        f"⚠️ **Download Timeout**\n\nMessage ID: {msg_id} after {RETRY_ATTEMPTS} retries",
-                        reply_to_message_id=message.id
-                    )
-                return None
         except Exception as e:
             batch_status.update_progress(user_id, msg_id, 0, f"Error: {str(e)}")
             # Retry on other errors
@@ -394,7 +375,7 @@ async def process_message_batch(
             session_string=user_data, 
             api_hash=API_HASH, 
             api_id=API_ID,
-            workers=MAX_PARALLEL_DOWNLOADS,  # Increase workers for parallel downloads
+            workers=4,  # Increase workers for parallel downloads
             sleep_threshold=30  # Reduce sleep threshold for faster responses
         )
         await acc.start()
@@ -444,7 +425,8 @@ async def process_message_batch(
                     )
 
     # Process messages in chunks to avoid overwhelming the system
-    chunk_size = MAX_PARALLEL_DOWNLOADS * 2
+-    chunk_size = MAX_PARALLEL_DOWNLOADS * 2
++    chunk_size = MAX_PARALLEL_DOWNLOADS
     for i in range(0, len(msg_ids), chunk_size):
         chunk = msg_ids[i:i + chunk_size]
         
